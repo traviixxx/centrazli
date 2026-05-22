@@ -5,11 +5,14 @@ Volume profile logic aligned with v18_advanced_v2 (4h/1d wide profile).
 Price poll: 3s | Profile refresh: 3min
 Logs/state: SOLUSDT_RRCAO/SOL_hvn_lvn_*
 
-v8 context-router update:
+v11 context-router + CHOP mixed-context update:
 - Classifies market context before strategy gating.
 - Blocks max-inverse shorts when the zone has become breakout acceptance/support.
 - Adds LONG bullish 4h HVN max reclaim/retest edge.
 - Adds per-zone cooldown after SL.
+- CHOP_MIXED_CONTEXT is no longer hard no-trade: it can run prioritized scalp playbooks:
+  CHOP_SWEEP_RECLAIM_SCALP -> CHOP_REJECTION_SCALP -> CHOP_MAX_INVERSE_SCALP ->
+  CHOP_VALUE_AREA_FADE -> CHOP_INSIDE_RANGE_NO_TRADE.
 - Resets loss streak on script restart by default, matching the old restart behavior.
   Optional restore mode: export SOL_RESET_LOSS_STREAK_ON_START=false.
 
@@ -129,7 +132,7 @@ REJECTION_WICK_RATIO = float(os.getenv("SOL_REJECTION_WICK_RATIO", "1.2"))
 # - BREAKOUT_ACCEPTANCE_UP blocks shorting a broken HVN max and allows long retest/reclaim.
 # - BREAKDOWN_ACCEPTANCE_DOWN blocks bottom-picking and allows bearish retests.
 # - LATE_IMPULSE_EXHAUSTION avoids chasing after price has already moved too far.
-# - CHOP_NO_TRADE rejects unclear mixed contexts.
+# - CHOP_MIXED_CONTEXT routes unclear mixed contexts to CHOP scalp playbooks; only CHOP_INSIDE_RANGE_NO_TRADE is final no-trade.
 CONTEXT_ROUTER_ENABLED = env_bool("SOL_CONTEXT_ROUTER_ENABLED", True)
 CONTEXT_TF = os.getenv("SOL_CONTEXT_TF", "15m").strip()
 CONTEXT_LOOKBACK_CANDLES = int(os.getenv("SOL_CONTEXT_LOOKBACK_CANDLES", "8"))
@@ -137,6 +140,13 @@ ACCEPTANCE_CANDLES = int(os.getenv("SOL_ACCEPTANCE_CANDLES", "2"))
 ACCEPTANCE_BUFFER = float(os.getenv("SOL_ACCEPTANCE_BUFFER", "0.03"))
 LATE_IMPULSE_POINTS = float(os.getenv("SOL_LATE_IMPULSE_POINTS", "0.70"))
 LATE_IMPULSE_LOOKBACK_CANDLES = int(os.getenv("SOL_LATE_IMPULSE_LOOKBACK_CANDLES", "5"))
+
+# Clean RANGE should be stricter than CHOP. After CHOP scalp playbooks were added,
+# mixed/noisy contexts should route to CHOP_MIXED_CONTEXT instead of being forced
+# into RANGE_MEAN_REVERSION with normal max-inverse TP/SL.
+RANGE_MAX_TREND_POINTS = float(os.getenv("SOL_RANGE_MAX_TREND_POINTS", "0.35"))
+RANGE_MAX_IMPULSE_POINTS = float(os.getenv("SOL_RANGE_MAX_IMPULSE_POINTS", "0.45"))
+RANGE_REQUIRE_NO_STRUCTURE = env_bool("SOL_RANGE_REQUIRE_NO_STRUCTURE", True)
 
 MAX_INVERSE_ALLOWED_TF = os.getenv("SOL_MAX_INVERSE_ALLOWED_TF", "4h").strip().lower()
 MAX_INVERSE_REQUIRE_RANGE_CONTEXT = env_bool("SOL_MAX_INVERSE_REQUIRE_RANGE_CONTEXT", True)
@@ -154,19 +164,46 @@ ZONE_COOLDOWN_AFTER_SL_SEC = float(os.getenv("SOL_ZONE_COOLDOWN_AFTER_SL_SEC", "
 MAX_ZONE_SL_COUNT = int(os.getenv("SOL_MAX_ZONE_SL_COUNT", "1"))
 ZONE_COOLDOWN_ENABLED = env_bool("SOL_ZONE_COOLDOWN_ENABLED", True)
 
-# Extra context-router diagnostics:
-# - Prints the active context/playbook even when price has not touched a zone yet.
-# - Optionally writes SCAN_STATUS_CONTEXT / SIGNAL_REJECTED events to the JSONL log for audit.
-CONTEXT_STATUS_LOG_ENABLED = env_bool("SOL_CONTEXT_STATUS_LOG_ENABLED", True)
-CONTEXT_STATUS_LOG_META = env_bool("SOL_CONTEXT_STATUS_LOG_META", True)
-CONTEXT_STATUS_LOG_TO_FILE = env_bool("SOL_CONTEXT_STATUS_LOG_TO_FILE", True)
-CONTEXT_REJECT_LOG_TO_FILE = env_bool("SOL_CONTEXT_REJECT_LOG_TO_FILE", True)
+# =========================
+# CHOP SCALP PLAYBOOKS
+# =========================
+# CHOP is not automatically untradeable. It is untradeable only in the middle of
+# the range / value area with no sweep, no rejection, and no edge.
+# Priority when context=CHOP_MIXED_CONTEXT:
+#   1) CHOP_SWEEP_RECLAIM_SCALP
+#   2) CHOP_REJECTION_SCALP
+#   3) CHOP_MAX_INVERSE_SCALP
+#   4) CHOP_VALUE_AREA_FADE
+#   5) CHOP_INSIDE_RANGE_NO_TRADE
+ENABLE_CHOP_SCALP = env_bool("SOL_ENABLE_CHOP_SCALP", True)
+CHOP_ALLOWED_TF = os.getenv("SOL_CHOP_ALLOWED_TF", "4h").strip().lower()
+CHOP_TOUCH_TOLERANCE = float(os.getenv("SOL_CHOP_TOUCH_TOLERANCE", str(ZONE_TOUCH_TOLERANCE)))
+CHOP_SCALP_TP_POINTS = float(os.getenv("SOL_CHOP_SCALP_TP_POINTS", "0.14"))
+CHOP_SCALP_SL_POINTS = float(os.getenv("SOL_CHOP_SCALP_SL_POINTS", "0.10"))
+CHOP_SCALP_MIN_RR = float(os.getenv("SOL_CHOP_SCALP_MIN_RR", "1.25"))
+CHOP_CONFIRM_BUFFER = float(os.getenv("SOL_CHOP_CONFIRM_BUFFER", "0.025"))
+CHOP_MAX_IMPULSE_POINTS = float(os.getenv("SOL_CHOP_MAX_IMPULSE_POINTS", "0.45"))
+CHOP_LOOKBACK_CANDLES = int(os.getenv("SOL_CHOP_LOOKBACK_CANDLES", "8"))
+CHOP_REQUIRE_NO_ACCEPTANCE = env_bool("SOL_CHOP_REQUIRE_NO_ACCEPTANCE", True)
+CHOP_ENABLE_SWEEP_RECLAIM = env_bool("SOL_CHOP_ENABLE_SWEEP_RECLAIM", True)
+CHOP_ENABLE_REJECTION_SCALP = env_bool("SOL_CHOP_ENABLE_REJECTION_SCALP", True)
+CHOP_ENABLE_MAX_INVERSE_SCALP = env_bool("SOL_CHOP_ENABLE_MAX_INVERSE_SCALP", True)
+CHOP_ENABLE_VALUE_AREA_FADE = env_bool("SOL_CHOP_ENABLE_VALUE_AREA_FADE", True)
+CHOP_VALUE_AREA_ENTRY_MAX_DISTANCE = float(os.getenv("SOL_CHOP_VALUE_AREA_ENTRY_MAX_DISTANCE", str(CHOP_TOUCH_TOLERANCE)))
+CHOP_VALUE_AREA_TP_POINTS = float(os.getenv("SOL_CHOP_VALUE_AREA_TP_POINTS", str(CHOP_SCALP_TP_POINTS)))
+CHOP_VALUE_AREA_SL_POINTS = float(os.getenv("SOL_CHOP_VALUE_AREA_SL_POINTS", str(CHOP_SCALP_SL_POINTS)))
+
+CHOP_PLAYBOOK_SWEEP_RECLAIM = "CHOP_SWEEP_RECLAIM_SCALP"
+CHOP_PLAYBOOK_REJECTION = "CHOP_REJECTION_SCALP"
+CHOP_PLAYBOOK_MAX_INVERSE = "CHOP_MAX_INVERSE_SCALP"
+CHOP_PLAYBOOK_VALUE_AREA_FADE = "CHOP_VALUE_AREA_FADE"
+CHOP_PLAYBOOK_INSIDE_NO_TRADE = "CHOP_INSIDE_RANGE_NO_TRADE"
 
 MARKET_CONTEXT_RANGE = "RANGE_MEAN_REVERSION"
 MARKET_CONTEXT_BREAKOUT_UP = "BREAKOUT_ACCEPTANCE_UP"
 MARKET_CONTEXT_BREAKDOWN_DOWN = "BREAKDOWN_ACCEPTANCE_DOWN"
 MARKET_CONTEXT_LATE_IMPULSE = "LATE_IMPULSE_EXHAUSTION"
-MARKET_CONTEXT_CHOP = "CHOP_NO_TRADE"
+MARKET_CONTEXT_CHOP = "CHOP_MIXED_CONTEXT"
 MARKET_CONTEXT_LEGACY = "LEGACY_NO_ROUTER"
 MARKET_CONTEXT_UNKNOWN = "UNKNOWN_CONTEXT"
 
@@ -903,121 +940,58 @@ def classify_market_context(price, trend, trend_15m, zone, level_name=None):
 
     price = float(price)
     inside_or_near_zone = (zone_low - ZONE_TOUCH_TOLERANCE) <= price <= (zone_high + ZONE_TOUCH_TOLERANCE)
-    if inside_or_near_zone and not accepted_above and not accepted_below:
-        meta.update({
-            "context": MARKET_CONTEXT_RANGE,
-            "reason": "inside_or_near_zone_without_acceptance",
-        })
-        return meta
 
-    if not accepted_above and not accepted_below and abs(trend_15m) <= LATE_IMPULSE_POINTS:
+    bullish_structure = bool(structure["higher_high"] and structure["higher_low"])
+    bearish_structure = bool(structure["lower_high"] and structure["lower_low"])
+    range_structure_ok = (not RANGE_REQUIRE_NO_STRUCTURE) or not (bullish_structure or bearish_structure)
+    range_trend_ok = abs(trend_15m) <= RANGE_MAX_TREND_POINTS
+    range_impulse_ok = impulse_points <= RANGE_MAX_IMPULSE_POINTS
+
+    meta.update({
+        "inside_or_near_zone": inside_or_near_zone,
+        "range_max_trend_points": RANGE_MAX_TREND_POINTS,
+        "range_max_impulse_points": RANGE_MAX_IMPULSE_POINTS,
+        "range_require_no_structure": RANGE_REQUIRE_NO_STRUCTURE,
+        "range_trend_ok": range_trend_ok,
+        "range_impulse_ok": range_impulse_ok,
+        "range_structure_ok": range_structure_ok,
+        "bullish_structure": bullish_structure,
+        "bearish_structure": bearish_structure,
+    })
+
+    # Clean range is now intentionally narrower than CHOP. Normal range max-inverse
+    # keeps normal TP/SL. Mixed context falls into CHOP_MIXED_CONTEXT and uses
+    # dedicated small scalp TP/SL if one of the CHOP playbooks confirms.
+    if (
+        inside_or_near_zone
+        and not accepted_above
+        and not accepted_below
+        and range_trend_ok
+        and range_impulse_ok
+        and range_structure_ok
+    ):
         meta.update({
             "context": MARKET_CONTEXT_RANGE,
-            "reason": "no_acceptance_and_moderate_trend",
+            "reason": (
+                "clean_range_inside_or_near_zone;"
+                f"trend_abs_{abs(trend_15m):.3f}_le_{RANGE_MAX_TREND_POINTS};"
+                f"impulse_{impulse_points:.3f}_le_{RANGE_MAX_IMPULSE_POINTS};"
+                f"structure_ok_{range_structure_ok}"
+            ),
         })
         return meta
 
     meta.update({
         "context": MARKET_CONTEXT_CHOP,
-        "reason": "mixed_context_no_clear_playbook",
+        "reason": (
+            "mixed_context_no_clear_playbook;"
+            f"inside_or_near_zone={inside_or_near_zone};"
+            f"range_trend_ok={range_trend_ok};"
+            f"range_impulse_ok={range_impulse_ok};"
+            f"range_structure_ok={range_structure_ok}"
+        ),
     })
     return meta
-
-
-def context_allowed_playbook(context, zone_kind=None, level_name=None, zone_tf=None):
-    """Human-readable playbook summary for no-trade/debug logs."""
-    context = context or MARKET_CONTEXT_UNKNOWN
-    zone_kind = str(zone_kind or "").upper()
-    level_name = str(level_name or "").lower()
-    zone_tf = str(zone_tf or "").lower()
-
-    if context == MARKET_CONTEXT_LEGACY:
-        return "legacy_router_off"
-    if context == MARKET_CONTEXT_RANGE:
-        if level_name == "max":
-            return "allow_range_max_inverse_or_rejection"
-        if level_name == "min" and zone_tf == "4h":
-            return "allow_range_retest_if_side_gate_passes"
-        return "allow_range_scalp_wait_touch"
-    if context == MARKET_CONTEXT_BREAKOUT_UP:
-        if zone_kind == "HVN" and level_name == "max" and zone_tf == "4h":
-            return "allow_long_4h_hvn_max_retest_block_max_inverse_short"
-        return "wait_pullback_long_bias_block_counter_short"
-    if context == MARKET_CONTEXT_BREAKDOWN_DOWN:
-        if level_name == "min" and zone_tf == "4h":
-            return "allow_short_4h_min_retest_block_bottom_pick"
-        return "wait_retest_short_bias_block_counter_long"
-    if context == MARKET_CONTEXT_LATE_IMPULSE:
-        return "no_chase_wait_pullback_or_new_acceptance"
-    if context == MARKET_CONTEXT_CHOP:
-        return "no_trade_chop_wait_clear_acceptance_or_range"
-    return "unknown_context_reduce_risk"
-
-
-def compact_context_meta(context_meta):
-    """Compact context metadata for console and JSONL diagnostics."""
-    if not isinstance(context_meta, dict):
-        return {}
-
-    keys = [
-        "context",
-        "reason",
-        "context_tf",
-        "accepted_above",
-        "accepted_below",
-        "closes_above_high",
-        "closes_below_low",
-        "acceptance_candles",
-        "acceptance_buffer",
-        "impulse_points",
-        "higher_high",
-        "higher_low",
-        "lower_high",
-        "lower_low",
-        "zone_low",
-        "zone_high",
-    ]
-    return {key: context_meta.get(key) for key in keys if key in context_meta}
-
-
-def format_context_meta_for_log(context_meta):
-    """Keep the scan line readable while still exposing why context_router blocked trades."""
-    if not CONTEXT_STATUS_LOG_META or not isinstance(context_meta, dict):
-        return ""
-
-    pieces = []
-    if "accepted_above" in context_meta or "accepted_below" in context_meta:
-        pieces.append(
-            f"acc↑={int(bool(context_meta.get('accepted_above')))}"
-            f"({context_meta.get('closes_above_high', 0)}/{context_meta.get('acceptance_candles', ACCEPTANCE_CANDLES)})"
-        )
-        pieces.append(
-            f"acc↓={int(bool(context_meta.get('accepted_below')))}"
-            f"({context_meta.get('closes_below_low', 0)}/{context_meta.get('acceptance_candles', ACCEPTANCE_CANDLES)})"
-        )
-    if context_meta.get("impulse_points") is not None:
-        pieces.append(f"impulse={context_meta.get('impulse_points')}pt≤{LATE_IMPULSE_POINTS}")
-    flags = []
-    if context_meta.get("higher_high"):
-        flags.append("HH")
-    if context_meta.get("higher_low"):
-        flags.append("HL")
-    if context_meta.get("lower_high"):
-        flags.append("LH")
-    if context_meta.get("lower_low"):
-        flags.append("LL")
-    if flags:
-        pieces.append("struct=" + "/".join(flags))
-
-    return " | " + " ".join(pieces) if pieces else ""
-
-
-def append_diagnostic_log(row):
-    """Best-effort JSONL diagnostic logging without breaking trading if file IO fails."""
-    try:
-        append_trade_log(row)
-    except Exception:
-        pass
 
 
 def retest_from_above(level_price, price, lookback=None):
@@ -1123,6 +1097,273 @@ def zone_cooldown_allows(signal):
     return True, "zone_cooldown_ok"
 
 
+
+
+def _closed_chop_candles(limit=None):
+    """Closed candles for CHOP scalp confirmation. Never use current forming candle."""
+    limit = limit or max(CHOP_LOOKBACK_CANDLES + 2, REJECTION_LOOKBACK_CANDLES + 2, 10)
+    return _closed_context_candles(SYMBOL, CONTEXT_TF, limit)
+
+
+def _chop_boundary_side(signal):
+    """CHOP boundary mean-reversion side: min -> LONG, max -> SHORT. Mid is no-trade."""
+    level_name = str(signal.get("level_name", "")).lower()
+    if level_name == "min":
+        return "LONG"
+    if level_name == "max":
+        return "SHORT"
+    return None
+
+
+def _chop_base_checks(signal, price, allow_value_area=False):
+    if not ENABLE_CHOP_SCALP:
+        return False, "chop_scalp_disabled"
+
+    context = signal.get("market_context") or MARKET_CONTEXT_UNKNOWN
+    if context != MARKET_CONTEXT_CHOP:
+        return False, f"not_chop_context_{context}"
+
+    zone_tf = str(signal.get("zone", {}).get("timeframe", "")).lower()
+    if not allow_value_area and CHOP_ALLOWED_TF and zone_tf != CHOP_ALLOWED_TF:
+        return False, f"chop_tf_{zone_tf}_not_{CHOP_ALLOWED_TF}"
+
+    if str(signal.get("level_name", "")).lower() == "mid":
+        return False, CHOP_PLAYBOOK_INSIDE_NO_TRADE
+
+    if float(signal.get("touch_distance", 9999)) > CHOP_TOUCH_TOLERANCE and not allow_value_area:
+        return False, f"chop_touch_distance_{signal.get('touch_distance')}_gt_{CHOP_TOUCH_TOLERANCE}"
+
+    context_meta = signal.get("context_meta") or {}
+    if CHOP_REQUIRE_NO_ACCEPTANCE and (context_meta.get("accepted_above") or context_meta.get("accepted_below")):
+        return False, "chop_reject_has_acceptance"
+
+    impulse = float(context_meta.get("impulse_points") or 0.0)
+    if impulse > CHOP_MAX_IMPULSE_POINTS:
+        return False, f"chop_impulse_{impulse:.3f}_gt_{CHOP_MAX_IMPULSE_POINTS}"
+
+    if CHOP_SCALP_SL_POINTS <= 0:
+        return False, "chop_invalid_sl_points"
+    rr = CHOP_SCALP_TP_POINTS / CHOP_SCALP_SL_POINTS
+    if rr < CHOP_SCALP_MIN_RR:
+        return False, f"chop_rr_{rr:.2f}_lt_{CHOP_SCALP_MIN_RR}"
+
+    return True, "chop_base_ok"
+
+
+def _apply_chop_bracket(signal, side, playbook, reason, tp_points=None, sl_points=None):
+    """Apply dedicated small CHOP scalp TP/SL instead of global HVN/LVN bracket."""
+    tp_points = float(tp_points if tp_points is not None else CHOP_SCALP_TP_POINTS)
+    sl_points = float(sl_points if sl_points is not None else CHOP_SCALP_SL_POINTS)
+    tp, sl, tp_dist, sl_dist = bracket_levels(
+        signal.get("entry") or signal.get("signal_price"),
+        side,
+        signal.get("zone_kind", "hvn"),
+        sl_points=sl_points,
+        tp_points=tp_points,
+    )
+    signal["side"] = side
+    signal["trend_side"] = side
+    signal["strategy_rule"] = playbook.lower()
+    signal["gate_reason"] = playbook
+    signal["chop_playbook"] = playbook
+    signal["chop_reason"] = reason
+    signal["chop_rr"] = round(tp_dist / max(sl_dist, 1e-12), 3)
+    signal["tp"] = tp
+    signal["sl"] = sl
+    signal["tp_points"] = tp_dist
+    signal["sl_points"] = sl_dist
+    signal["retest_confirmed"] = playbook in (CHOP_PLAYBOOK_SWEEP_RECLAIM, CHOP_PLAYBOOK_VALUE_AREA_FADE)
+    signal["retest_reason"] = reason
+    return True, playbook
+
+
+def _find_sweep_reclaim_candle(side, level_price, candles):
+    level = float(level_price)
+    side = str(side).upper()
+    for candle in reversed(candles[-max(1, min(CHOP_LOOKBACK_CANDLES, len(candles))):]):
+        high = float(candle["high"])
+        low = float(candle["low"])
+        close = float(candle["close"])
+        if side == "LONG":
+            if low < level - CHOP_CONFIRM_BUFFER and close > level + CHOP_CONFIRM_BUFFER:
+                return candle
+        else:
+            if high > level + CHOP_CONFIRM_BUFFER and close < level - CHOP_CONFIRM_BUFFER:
+                return candle
+    return None
+
+
+def _find_rejection_candle(side, level_price, candles):
+    side = str(side).upper()
+    for candle in reversed(candles[-max(1, min(REJECTION_LOOKBACK_CANDLES, len(candles))):]):
+        if candle_rejection_confirms_side(candle, side, level_price):
+            return candle
+    return None
+
+
+def _try_chop_sweep_reclaim(signal, price):
+    if not CHOP_ENABLE_SWEEP_RECLAIM:
+        return False, "chop_sweep_reclaim_disabled"
+    ok, reason = _chop_base_checks(signal, price)
+    if not ok:
+        return False, reason
+    side = _chop_boundary_side(signal)
+    if side is None:
+        return False, CHOP_PLAYBOOK_INSIDE_NO_TRADE
+    candles = _closed_chop_candles()
+    if not candles:
+        return False, "chop_sweep_reclaim_no_closed_candles"
+    candle = _find_sweep_reclaim_candle(side, signal["level_price"], candles)
+    if candle is None:
+        return False, "chop_no_sweep_reclaim_confirm"
+    close = float(candle.get("close"))
+    reason = f"sweep_reclaim_{side.lower()}_close_{close:.{PRICE_DECIMALS}f}_level_{float(signal['level_price']):.{PRICE_DECIMALS}f}"
+    return _apply_chop_bracket(signal, side, CHOP_PLAYBOOK_SWEEP_RECLAIM, reason)
+
+
+def _try_chop_rejection(signal, price):
+    if not CHOP_ENABLE_REJECTION_SCALP:
+        return False, "chop_rejection_scalp_disabled"
+    ok, reason = _chop_base_checks(signal, price)
+    if not ok:
+        return False, reason
+    side = _chop_boundary_side(signal)
+    if side is None:
+        return False, CHOP_PLAYBOOK_INSIDE_NO_TRADE
+    candles = _closed_chop_candles()
+    if not candles:
+        return False, "chop_rejection_no_closed_candles"
+    candle = _find_rejection_candle(side, signal["level_price"], candles)
+    if candle is None:
+        return False, "chop_no_rejection_confirm"
+    reason = f"rejection_{side.lower()}_level_{float(signal['level_price']):.{PRICE_DECIMALS}f}"
+    signal["rejection_confirmed"] = True
+    return _apply_chop_bracket(signal, side, CHOP_PLAYBOOK_REJECTION, reason)
+
+
+def _try_chop_max_inverse(signal, price):
+    if not CHOP_ENABLE_MAX_INVERSE_SCALP:
+        return False, "chop_max_inverse_disabled"
+    ok, reason = _chop_base_checks(signal, price)
+    if not ok:
+        return False, reason
+    if str(signal.get("level_name", "")).lower() != "max":
+        return False, "chop_max_inverse_only_level_max"
+    side = "SHORT"
+    reason = f"max_inverse_scalp_no_acceptance_impulse_{float((signal.get('context_meta') or {}).get('impulse_points') or 0):.3f}"
+    return _apply_chop_bracket(signal, side, CHOP_PLAYBOOK_MAX_INVERSE, reason)
+
+
+def _try_chop_playbooks(signal, price):
+    """Priority router for CHOP scalp playbooks."""
+    checks = (
+        _try_chop_sweep_reclaim,
+        _try_chop_rejection,
+        _try_chop_max_inverse,
+    )
+    last_reason = CHOP_PLAYBOOK_INSIDE_NO_TRADE
+    for fn in checks:
+        ok, reason = fn(signal, price)
+        if ok:
+            return True, reason
+        last_reason = reason
+    signal["chop_playbook"] = CHOP_PLAYBOOK_INSIDE_NO_TRADE
+    signal["chop_reason"] = last_reason
+    return False, f"{CHOP_PLAYBOOK_INSIDE_NO_TRADE}:{last_reason}"
+
+
+def _chop_signal_priority(signal):
+    playbook = signal.get("chop_playbook")
+    order = {
+        CHOP_PLAYBOOK_SWEEP_RECLAIM: 1,
+        CHOP_PLAYBOOK_REJECTION: 2,
+        CHOP_PLAYBOOK_MAX_INVERSE: 3,
+        CHOP_PLAYBOOK_VALUE_AREA_FADE: 4,
+    }
+    return order.get(playbook, 50)
+
+
+def build_chop_value_area_signal(price, volume_zone, trend, trend_15m):
+    if not (ENABLE_CHOP_SCALP and CHOP_ENABLE_VALUE_AREA_FADE):
+        return None, "chop_value_area_fade_disabled"
+    if not volume_zone.get("available"):
+        return None, "chop_va_no_volume_profile"
+
+    val = volume_zone.get("value_area_low")
+    vah = volume_zone.get("value_area_high")
+    if val is None or vah is None:
+        return None, "chop_va_missing_val_vah"
+
+    price = float(price)
+    boundaries = [
+        ("value_area_low", float(val), "LONG"),
+        ("value_area_high", float(vah), "SHORT"),
+    ]
+    boundary_name, level_price, side = min(boundaries, key=lambda x: abs(price - x[1]))
+    dist = abs(price - level_price)
+    if dist > CHOP_VALUE_AREA_ENTRY_MAX_DISTANCE:
+        return None, f"chop_va_distance_{dist:.3f}_gt_{CHOP_VALUE_AREA_ENTRY_MAX_DISTANCE}"
+
+    zone = {
+        "timeframe": volume_zone.get("primary_timeframe"),
+        "low": level_price,
+        "high": level_price,
+        "price": level_price,
+        "value_area_low": float(val),
+        "value_area_high": float(vah),
+    }
+    context_meta = classify_market_context(price, trend, trend_15m, zone, boundary_name)
+    signal = {
+        "side": side,
+        "trend_side": side,
+        "trend": trend,
+        "zone_kind": "value_area",
+        "zone": zone,
+        "level_name": boundary_name,
+        "level_price": level_price,
+        "entry": round_price(price),
+        "touch_distance": round(dist, PRICE_DECIMALS),
+        "rejection_confirmed": False,
+        "strategy_rule": CHOP_PLAYBOOK_VALUE_AREA_FADE.lower(),
+        "market_context": context_meta.get("context"),
+        "context_reason": context_meta.get("reason"),
+        "context_meta": context_meta,
+    }
+
+    # VA fade is a CHOP scalp only if there is no fresh directional acceptance at the boundary.
+    # For a zero-width boundary, classify_market_context may call it RANGE/UNKNOWN; allow those
+    # if the acceptance flags are still false, but do not allow breakout/breakdown/late-impulse.
+    blocked_contexts = {MARKET_CONTEXT_BREAKOUT_UP, MARKET_CONTEXT_BREAKDOWN_DOWN, MARKET_CONTEXT_LATE_IMPULSE}
+    if context_meta.get("context") in blocked_contexts:
+        return None, f"chop_va_blocked_context_{context_meta.get('context')}"
+    if CHOP_REQUIRE_NO_ACCEPTANCE and (context_meta.get("accepted_above") or context_meta.get("accepted_below")):
+        return None, "chop_va_reject_has_acceptance"
+
+    tp, sl, tp_dist, sl_dist = bracket_levels(
+        price,
+        side,
+        "value_area",
+        sl_points=CHOP_VALUE_AREA_SL_POINTS,
+        tp_points=CHOP_VALUE_AREA_TP_POINTS,
+    )
+    rr = tp_dist / max(sl_dist, 1e-12)
+    if rr < CHOP_SCALP_MIN_RR:
+        return None, f"chop_va_rr_{rr:.2f}_lt_{CHOP_SCALP_MIN_RR}"
+
+    signal.update({
+        "tp": tp,
+        "sl": sl,
+        "tp_points": tp_dist,
+        "sl_points": sl_dist,
+        "gate_reason": CHOP_PLAYBOOK_VALUE_AREA_FADE,
+        "chop_playbook": CHOP_PLAYBOOK_VALUE_AREA_FADE,
+        "chop_reason": f"value_area_fade_{side.lower()}_{boundary_name}_dist_{dist:.3f}",
+        "chop_rr": round(rr, 3),
+        "retest_confirmed": True,
+        "retest_reason": f"value_area_boundary_fade_{boundary_name}",
+    })
+    return signal, CHOP_PLAYBOOK_VALUE_AREA_FADE
+
 def resolve_side(price, trend, trend_15m, zone_kind, zone, level_name, level_price):
     trend_side = resolve_trend_side(trend, trend_15m, price, level_price)
     rejection_confirmed = False
@@ -1151,7 +1392,7 @@ def resolve_side(price, trend, trend_15m, zone_kind, zone, level_name, level_pri
 
 
 def validate_strategy_signal(signal, price):
-    """Hard gate theo audit mới: context first, strategy second."""
+    """Hard gate: context first, then prioritized strategy/playbook."""
     side = signal["side"]
     trend = signal["trend"]
     zone_tf = str(signal["zone"].get("timeframe", "")).lower()
@@ -1163,6 +1404,19 @@ def validate_strategy_signal(signal, price):
     if not cooldown_ok:
         return False, cooldown_reason
 
+    # Dedicated CHOP scalp router. CHOP_MIXED_CONTEXT is no longer a blanket no-trade state:
+    # it can trade only at valid boundaries with small dedicated TP/SL.
+    if CONTEXT_ROUTER_ENABLED and context == MARKET_CONTEXT_CHOP:
+        ok, reason = _try_chop_playbooks(signal, price)
+        if ok:
+            return True, signal["gate_reason"]
+        return False, reason
+
+    # Value-area fade can be built as a separate CHOP/range boundary signal.
+    if signal.get("chop_playbook") == CHOP_PLAYBOOK_VALUE_AREA_FADE:
+        signal["gate_reason"] = CHOP_PLAYBOOK_VALUE_AREA_FADE
+        return True, signal["gate_reason"]
+
     # Priority edge: bullish breakout acceptance + HVN max retest/reclaim.
     if rule == "long_bullish_4h_max_retest":
         if CONTEXT_ROUTER_ENABLED and context != MARKET_CONTEXT_BREAKOUT_UP:
@@ -1173,8 +1427,8 @@ def validate_strategy_signal(signal, price):
         signal["gate_reason"] = "long_bullish_4h_max_retest_edge"
         return True, signal["gate_reason"]
 
-    # Max inverse is only a range/mean-reversion playbook. In breakout acceptance,
-    # HVN max has role-flipped into support, so shorting it is explicitly blocked.
+    # Max inverse is a range/mean-reversion playbook outside CHOP. In CHOP it is
+    # handled by CHOP_MAX_INVERSE_SCALP with stricter TP/SL and impulse checks.
     if level_name == "max" and ENABLE_MAX_INVERSE:
         if MAX_INVERSE_ALLOWED_TF and zone_tf != MAX_INVERSE_ALLOWED_TF:
             return False, f"reject_max_inverse_tf_{zone_tf}_not_{MAX_INVERSE_ALLOWED_TF}"
@@ -1333,7 +1587,12 @@ def scan_zone_touch(price, volume_zone, trend, trend_15m):
         for zone in zones:
             for level_name, level_price in zone_level_points(zone):
                 dist = distance_to_level(price, level_price)
-                if dist <= ZONE_TOUCH_TOLERANCE:
+                # CHOP scalp can use a slightly wider touch band than normal entries,
+                # but only for min/max boundaries. Mid remains no-trade.
+                allowed_touch = ZONE_TOUCH_TOLERANCE
+                if level_name in ("min", "max") and ENABLE_CHOP_SCALP:
+                    allowed_touch = max(allowed_touch, CHOP_TOUCH_TOLERANCE)
+                if dist <= allowed_touch:
                     signal = build_touch_signal(
                         price, trend, trend_15m, zone_kind, zone, level_name, level_price
                     )
@@ -1344,45 +1603,33 @@ def scan_zone_touch(price, volume_zone, trend, trend_15m):
                         signal["reject_reason"] = reason
                         rejected.append(signal)
 
+    # Optional VA boundary scalp. It is added after HVN/LVN CHOP playbooks in priority,
+    # but can still produce a trade when no HVN/LVN boundary signal is available.
+    va_signal, va_reason = build_chop_value_area_signal(price, volume_zone, trend, trend_15m)
+    if va_signal is not None:
+        cooldown_ok, cooldown_reason = zone_cooldown_allows(va_signal)
+        if cooldown_ok:
+            candidates.append(va_signal)
+        else:
+            va_signal["reject_reason"] = cooldown_reason
+            rejected.append(va_signal)
+
     if not candidates:
         if rejected:
-            best_reject = min(rejected, key=lambda item: item["touch_distance"])
-            playbook = context_allowed_playbook(
-                best_reject.get("market_context"),
-                best_reject.get("zone_kind"),
-                best_reject.get("level_name"),
-                best_reject.get("zone", {}).get("timeframe"),
-            )
+            best_reject = min(rejected, key=lambda item: (_chop_signal_priority(item), item["touch_distance"]))
+            chop_info = ""
+            if best_reject.get("chop_playbook"):
+                chop_info = f" chop={best_reject.get('chop_playbook')} chop_reason={best_reject.get('chop_reason')}"
             print(
                 f"⚠️ signal rejected | {best_reject['side']} {best_reject['zone_kind'].upper()} "
                 f"{best_reject['level_name']}={best_reject['level_price']} "
                 f"tf={best_reject['zone'].get('timeframe')} rule={best_reject.get('strategy_rule')} "
-                f"context={best_reject.get('market_context')} playbook={playbook} "
-                f"ctx_reason={best_reject.get('context_reason')} "
-                f"reason={best_reject.get('reject_reason')}"
+                f"context={best_reject.get('market_context')} "
+                f"reason={best_reject.get('reject_reason')}{chop_info}"
             )
-            if CONTEXT_REJECT_LOG_TO_FILE:
-                append_diagnostic_log({
-                    "event": "SIGNAL_REJECTED",
-                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "symbol": SYMBOL,
-                    "price": round_price(price),
-                    "side": best_reject.get("side"),
-                    "zone_kind": best_reject.get("zone_kind"),
-                    "zone_timeframe": best_reject.get("zone", {}).get("timeframe"),
-                    "level_name": best_reject.get("level_name"),
-                    "level_price": best_reject.get("level_price"),
-                    "touch_distance": best_reject.get("touch_distance"),
-                    "strategy_rule": best_reject.get("strategy_rule"),
-                    "reject_reason": best_reject.get("reject_reason"),
-                    "market_context": best_reject.get("market_context"),
-                    "context_reason": best_reject.get("context_reason"),
-                    "allowed_playbook": playbook,
-                    "context_meta": compact_context_meta(best_reject.get("context_meta")),
-                })
         return None
-    return min(candidates, key=lambda item: item["touch_distance"])
 
+    return min(candidates, key=lambda item: (_chop_signal_priority(item), item["touch_distance"]))
 
 def nearest_touch_candidate(price, volume_zone):
     if not volume_zone.get("available"):
@@ -1398,7 +1645,6 @@ def nearest_touch_candidate(price, volume_zone):
                 row = {
                     "distance": dist,
                     "zone_kind": zone_kind,
-                    "zone": zone,
                     "level_name": level_name,
                     "level_price": level_price,
                     "timeframe": zone.get("timeframe"),
@@ -1408,7 +1654,7 @@ def nearest_touch_candidate(price, volume_zone):
     return best
 
 
-def maybe_print_scan_status(price, volume_zone, trend, trend_15m, cycle_ts):
+def maybe_print_scan_status(price, volume_zone, cycle_ts):
     global _last_scan_status_ts
     now = time.time()
     if now - _last_scan_status_ts < SCAN_STATUS_SEC:
@@ -1424,78 +1670,18 @@ def maybe_print_scan_status(price, volume_zone, trend, trend_15m, cycle_ts):
     touch = nearest_touch_candidate(price, volume_zone)
     if not touch:
         print(f"[{cycle_ts}] 🔍 scan price={price:.{PRICE_DECIMALS}f} | workflow={workflow} | nearest touch: no HVN/LVN zones")
-        if CONTEXT_STATUS_LOG_TO_FILE:
-            append_diagnostic_log({
-                "event": "SCAN_STATUS_CONTEXT",
-                "ts": cycle_ts,
-                "symbol": SYMBOL,
-                "price": round_price(price),
-                "workflow": workflow,
-                "reason": "no_hvn_lvn_zones",
-            })
         return
 
     dist = touch["distance"]
     ready = dist <= ZONE_TOUCH_TOLERANCE
-
-    context_meta = {}
-    context = None
-    playbook = "context_log_disabled"
-    context_reason = None
-    if CONTEXT_STATUS_LOG_ENABLED:
-        context_meta = classify_market_context(
-            price,
-            trend,
-            trend_15m,
-            touch.get("zone") or {},
-            touch.get("level_name"),
-        )
-        context = context_meta.get("context")
-        context_reason = context_meta.get("reason")
-        playbook = context_allowed_playbook(
-            context,
-            touch.get("zone_kind"),
-            touch.get("level_name"),
-            touch.get("timeframe"),
-        )
-
-    context_part = ""
-    if CONTEXT_STATUS_LOG_ENABLED:
-        context_part = (
-            f" | context={context} | playbook={playbook} | ctx_reason={context_reason}"
-            f"{format_context_meta_for_log(context_meta)}"
-        )
-
     print(
         f"[{cycle_ts}] 🔍 scan price={price:.{PRICE_DECIMALS}f} | workflow={workflow} | "
         f"nearest={dist:.{PRICE_DECIMALS}f}pt away "
         f"({touch['zone_kind'].upper()} {touch['level_name']}={touch['level_price']} "
         f"{touch.get('timeframe') or ''}) | need ≤{ZONE_TOUCH_TOLERANCE}pt | "
         f"{'✓ READY' if ready else 'waiting'}"
-        f"{context_part}"
     )
 
-    if CONTEXT_STATUS_LOG_TO_FILE:
-        append_diagnostic_log({
-            "event": "SCAN_STATUS_CONTEXT",
-            "ts": cycle_ts,
-            "symbol": SYMBOL,
-            "price": round_price(price),
-            "workflow": workflow,
-            "nearest_distance": round(float(dist), PRICE_DECIMALS),
-            "ready": bool(ready),
-            "zone_kind": touch.get("zone_kind"),
-            "zone_timeframe": touch.get("timeframe"),
-            "level_name": touch.get("level_name"),
-            "level_price": touch.get("level_price"),
-            "need_touch_tolerance": ZONE_TOUCH_TOLERANCE,
-            "trend": trend,
-            "trend_15m": round(float(trend_15m or 0.0), PRICE_DECIMALS),
-            "market_context": context,
-            "context_reason": context_reason,
-            "allowed_playbook": playbook,
-            "context_meta": compact_context_meta(context_meta),
-        })
 
 # =========================
 # TRADE (SIM + LIVE)
@@ -1536,6 +1722,11 @@ def trade_base(signal, price, cycle_ts):
         "tp": signal["tp"],
         "tp_points": signal["tp_points"],
         "sl_points": signal["sl_points"],
+        "chop_playbook": signal.get("chop_playbook"),
+        "chop_reason": signal.get("chop_reason"),
+        "chop_rr": signal.get("chop_rr"),
+        "value_area_low": signal.get("zone", {}).get("value_area_low"),
+        "value_area_high": signal.get("zone", {}).get("value_area_high"),
         "signal_price": round_price(price),
         "opened_ts": cycle_ts,
         "opened_ts_ms": int(time.time() * 1000),
@@ -2292,13 +2483,19 @@ def run():
         f"strict_edge={STRICT_EDGE_ONLY} | max_inverse={ENABLE_MAX_INVERSE} | "
         f"max_inverse_tf={MAX_INVERSE_ALLOWED_TF} | context_router={CONTEXT_ROUTER_ENABLED} | "
         f"acceptance={ACCEPTANCE_CANDLES}c/{ACCEPTANCE_BUFFER}pt | "
+        f"range_clean=trend≤{RANGE_MAX_TREND_POINTS}/impulse≤{RANGE_MAX_IMPULSE_POINTS}/no_structure={RANGE_REQUIRE_NO_STRUCTURE} | "
         f"rejection_follow_trend={ENABLE_REJECTION_FOLLOW_TREND} | "
         f"long_bullish_4h_max={ENABLE_LONG_BULLISH_4H_MAX_EDGE} | "
         f"short_edge_4h_min={ENABLE_SHORT_BEARISH_4H_MIN_EDGE} | "
         f"max_retest_impulse={MAX_RETEST_IMPULSE_POINTS}pt/{RETEST_LOOKBACK_CANDLES} candles | "
-        f"zone_cooldown={ZONE_COOLDOWN_ENABLED}/{int(ZONE_COOLDOWN_AFTER_SL_SEC)}s/{MAX_ZONE_SL_COUNT}sl | "
-        f"context_log={CONTEXT_STATUS_LOG_ENABLED} meta={CONTEXT_STATUS_LOG_META} "
-        f"scan_jsonl={CONTEXT_STATUS_LOG_TO_FILE} reject_jsonl={CONTEXT_REJECT_LOG_TO_FILE}"
+        f"zone_cooldown={ZONE_COOLDOWN_ENABLED}/{int(ZONE_COOLDOWN_AFTER_SL_SEC)}s/{MAX_ZONE_SL_COUNT}sl"
+    )
+    print(
+        f"chop_scalp={ENABLE_CHOP_SCALP} | tf={CHOP_ALLOWED_TF} | touch≤{CHOP_TOUCH_TOLERANCE} | "
+        f"TP/SL={CHOP_SCALP_TP_POINTS}/{CHOP_SCALP_SL_POINTS} RR≥{CHOP_SCALP_MIN_RR} | "
+        f"impulse≤{CHOP_MAX_IMPULSE_POINTS} | sweep={CHOP_ENABLE_SWEEP_RECLAIM} | "
+        f"rejection={CHOP_ENABLE_REJECTION_SCALP} | max_inverse={CHOP_ENABLE_MAX_INVERSE_SCALP} | "
+        f"va_fade={CHOP_ENABLE_VALUE_AREA_FADE} dist≤{CHOP_VALUE_AREA_ENTRY_MAX_DISTANCE}"
     )
     print(f"balance={SIM_BALANCE:.1f} | closed_trades={len(TRADE_HISTORY)} (chỉ sau FILLED + đóng lệnh)")
     print(f"state={STATE_PATH}")
@@ -2349,7 +2546,7 @@ def run():
                 f"balance={SIM_BALANCE:.1f}"
             )
 
-        maybe_print_scan_status(price, volume_zone, trend, trend_15m, cycle_ts)
+        maybe_print_scan_status(price, volume_zone, cycle_ts)
 
         if not has_active_workflow() and SIM_BALANCE > 0:
             signal = scan_zone_touch(price, volume_zone, trend, trend_15m)
