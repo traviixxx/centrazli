@@ -154,6 +154,14 @@ ZONE_COOLDOWN_AFTER_SL_SEC = float(os.getenv("SOL_ZONE_COOLDOWN_AFTER_SL_SEC", "
 MAX_ZONE_SL_COUNT = int(os.getenv("SOL_MAX_ZONE_SL_COUNT", "1"))
 ZONE_COOLDOWN_ENABLED = env_bool("SOL_ZONE_COOLDOWN_ENABLED", True)
 
+# Extra context-router diagnostics:
+# - Prints the active context/playbook even when price has not touched a zone yet.
+# - Optionally writes SCAN_STATUS_CONTEXT / SIGNAL_REJECTED events to the JSONL log for audit.
+CONTEXT_STATUS_LOG_ENABLED = env_bool("SOL_CONTEXT_STATUS_LOG_ENABLED", True)
+CONTEXT_STATUS_LOG_META = env_bool("SOL_CONTEXT_STATUS_LOG_META", True)
+CONTEXT_STATUS_LOG_TO_FILE = env_bool("SOL_CONTEXT_STATUS_LOG_TO_FILE", True)
+CONTEXT_REJECT_LOG_TO_FILE = env_bool("SOL_CONTEXT_REJECT_LOG_TO_FILE", True)
+
 MARKET_CONTEXT_RANGE = "RANGE_MEAN_REVERSION"
 MARKET_CONTEXT_BREAKOUT_UP = "BREAKOUT_ACCEPTANCE_UP"
 MARKET_CONTEXT_BREAKDOWN_DOWN = "BREAKDOWN_ACCEPTANCE_DOWN"
@@ -916,6 +924,102 @@ def classify_market_context(price, trend, trend_15m, zone, level_name=None):
     return meta
 
 
+def context_allowed_playbook(context, zone_kind=None, level_name=None, zone_tf=None):
+    """Human-readable playbook summary for no-trade/debug logs."""
+    context = context or MARKET_CONTEXT_UNKNOWN
+    zone_kind = str(zone_kind or "").upper()
+    level_name = str(level_name or "").lower()
+    zone_tf = str(zone_tf or "").lower()
+
+    if context == MARKET_CONTEXT_LEGACY:
+        return "legacy_router_off"
+    if context == MARKET_CONTEXT_RANGE:
+        if level_name == "max":
+            return "allow_range_max_inverse_or_rejection"
+        if level_name == "min" and zone_tf == "4h":
+            return "allow_range_retest_if_side_gate_passes"
+        return "allow_range_scalp_wait_touch"
+    if context == MARKET_CONTEXT_BREAKOUT_UP:
+        if zone_kind == "HVN" and level_name == "max" and zone_tf == "4h":
+            return "allow_long_4h_hvn_max_retest_block_max_inverse_short"
+        return "wait_pullback_long_bias_block_counter_short"
+    if context == MARKET_CONTEXT_BREAKDOWN_DOWN:
+        if level_name == "min" and zone_tf == "4h":
+            return "allow_short_4h_min_retest_block_bottom_pick"
+        return "wait_retest_short_bias_block_counter_long"
+    if context == MARKET_CONTEXT_LATE_IMPULSE:
+        return "no_chase_wait_pullback_or_new_acceptance"
+    if context == MARKET_CONTEXT_CHOP:
+        return "no_trade_chop_wait_clear_acceptance_or_range"
+    return "unknown_context_reduce_risk"
+
+
+def compact_context_meta(context_meta):
+    """Compact context metadata for console and JSONL diagnostics."""
+    if not isinstance(context_meta, dict):
+        return {}
+
+    keys = [
+        "context",
+        "reason",
+        "context_tf",
+        "accepted_above",
+        "accepted_below",
+        "closes_above_high",
+        "closes_below_low",
+        "acceptance_candles",
+        "acceptance_buffer",
+        "impulse_points",
+        "higher_high",
+        "higher_low",
+        "lower_high",
+        "lower_low",
+        "zone_low",
+        "zone_high",
+    ]
+    return {key: context_meta.get(key) for key in keys if key in context_meta}
+
+
+def format_context_meta_for_log(context_meta):
+    """Keep the scan line readable while still exposing why context_router blocked trades."""
+    if not CONTEXT_STATUS_LOG_META or not isinstance(context_meta, dict):
+        return ""
+
+    pieces = []
+    if "accepted_above" in context_meta or "accepted_below" in context_meta:
+        pieces.append(
+            f"acc↑={int(bool(context_meta.get('accepted_above')))}"
+            f"({context_meta.get('closes_above_high', 0)}/{context_meta.get('acceptance_candles', ACCEPTANCE_CANDLES)})"
+        )
+        pieces.append(
+            f"acc↓={int(bool(context_meta.get('accepted_below')))}"
+            f"({context_meta.get('closes_below_low', 0)}/{context_meta.get('acceptance_candles', ACCEPTANCE_CANDLES)})"
+        )
+    if context_meta.get("impulse_points") is not None:
+        pieces.append(f"impulse={context_meta.get('impulse_points')}pt≤{LATE_IMPULSE_POINTS}")
+    flags = []
+    if context_meta.get("higher_high"):
+        flags.append("HH")
+    if context_meta.get("higher_low"):
+        flags.append("HL")
+    if context_meta.get("lower_high"):
+        flags.append("LH")
+    if context_meta.get("lower_low"):
+        flags.append("LL")
+    if flags:
+        pieces.append("struct=" + "/".join(flags))
+
+    return " | " + " ".join(pieces) if pieces else ""
+
+
+def append_diagnostic_log(row):
+    """Best-effort JSONL diagnostic logging without breaking trading if file IO fails."""
+    try:
+        append_trade_log(row)
+    except Exception:
+        pass
+
+
 def retest_from_above(level_price, price, lookback=None):
     """LONG bullish edge: price accepted above a level and is now retesting it from above."""
     lookback = lookback or RETEST_LOOKBACK_CANDLES
@@ -1243,13 +1347,39 @@ def scan_zone_touch(price, volume_zone, trend, trend_15m):
     if not candidates:
         if rejected:
             best_reject = min(rejected, key=lambda item: item["touch_distance"])
+            playbook = context_allowed_playbook(
+                best_reject.get("market_context"),
+                best_reject.get("zone_kind"),
+                best_reject.get("level_name"),
+                best_reject.get("zone", {}).get("timeframe"),
+            )
             print(
                 f"⚠️ signal rejected | {best_reject['side']} {best_reject['zone_kind'].upper()} "
                 f"{best_reject['level_name']}={best_reject['level_price']} "
                 f"tf={best_reject['zone'].get('timeframe')} rule={best_reject.get('strategy_rule')} "
-                f"context={best_reject.get('market_context')} "
+                f"context={best_reject.get('market_context')} playbook={playbook} "
+                f"ctx_reason={best_reject.get('context_reason')} "
                 f"reason={best_reject.get('reject_reason')}"
             )
+            if CONTEXT_REJECT_LOG_TO_FILE:
+                append_diagnostic_log({
+                    "event": "SIGNAL_REJECTED",
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "symbol": SYMBOL,
+                    "price": round_price(price),
+                    "side": best_reject.get("side"),
+                    "zone_kind": best_reject.get("zone_kind"),
+                    "zone_timeframe": best_reject.get("zone", {}).get("timeframe"),
+                    "level_name": best_reject.get("level_name"),
+                    "level_price": best_reject.get("level_price"),
+                    "touch_distance": best_reject.get("touch_distance"),
+                    "strategy_rule": best_reject.get("strategy_rule"),
+                    "reject_reason": best_reject.get("reject_reason"),
+                    "market_context": best_reject.get("market_context"),
+                    "context_reason": best_reject.get("context_reason"),
+                    "allowed_playbook": playbook,
+                    "context_meta": compact_context_meta(best_reject.get("context_meta")),
+                })
         return None
     return min(candidates, key=lambda item: item["touch_distance"])
 
@@ -1268,6 +1398,7 @@ def nearest_touch_candidate(price, volume_zone):
                 row = {
                     "distance": dist,
                     "zone_kind": zone_kind,
+                    "zone": zone,
                     "level_name": level_name,
                     "level_price": level_price,
                     "timeframe": zone.get("timeframe"),
@@ -1277,7 +1408,7 @@ def nearest_touch_candidate(price, volume_zone):
     return best
 
 
-def maybe_print_scan_status(price, volume_zone, cycle_ts):
+def maybe_print_scan_status(price, volume_zone, trend, trend_15m, cycle_ts):
     global _last_scan_status_ts
     now = time.time()
     if now - _last_scan_status_ts < SCAN_STATUS_SEC:
@@ -1293,18 +1424,78 @@ def maybe_print_scan_status(price, volume_zone, cycle_ts):
     touch = nearest_touch_candidate(price, volume_zone)
     if not touch:
         print(f"[{cycle_ts}] 🔍 scan price={price:.{PRICE_DECIMALS}f} | workflow={workflow} | nearest touch: no HVN/LVN zones")
+        if CONTEXT_STATUS_LOG_TO_FILE:
+            append_diagnostic_log({
+                "event": "SCAN_STATUS_CONTEXT",
+                "ts": cycle_ts,
+                "symbol": SYMBOL,
+                "price": round_price(price),
+                "workflow": workflow,
+                "reason": "no_hvn_lvn_zones",
+            })
         return
 
     dist = touch["distance"]
     ready = dist <= ZONE_TOUCH_TOLERANCE
+
+    context_meta = {}
+    context = None
+    playbook = "context_log_disabled"
+    context_reason = None
+    if CONTEXT_STATUS_LOG_ENABLED:
+        context_meta = classify_market_context(
+            price,
+            trend,
+            trend_15m,
+            touch.get("zone") or {},
+            touch.get("level_name"),
+        )
+        context = context_meta.get("context")
+        context_reason = context_meta.get("reason")
+        playbook = context_allowed_playbook(
+            context,
+            touch.get("zone_kind"),
+            touch.get("level_name"),
+            touch.get("timeframe"),
+        )
+
+    context_part = ""
+    if CONTEXT_STATUS_LOG_ENABLED:
+        context_part = (
+            f" | context={context} | playbook={playbook} | ctx_reason={context_reason}"
+            f"{format_context_meta_for_log(context_meta)}"
+        )
+
     print(
         f"[{cycle_ts}] 🔍 scan price={price:.{PRICE_DECIMALS}f} | workflow={workflow} | "
         f"nearest={dist:.{PRICE_DECIMALS}f}pt away "
         f"({touch['zone_kind'].upper()} {touch['level_name']}={touch['level_price']} "
         f"{touch.get('timeframe') or ''}) | need ≤{ZONE_TOUCH_TOLERANCE}pt | "
         f"{'✓ READY' if ready else 'waiting'}"
+        f"{context_part}"
     )
 
+    if CONTEXT_STATUS_LOG_TO_FILE:
+        append_diagnostic_log({
+            "event": "SCAN_STATUS_CONTEXT",
+            "ts": cycle_ts,
+            "symbol": SYMBOL,
+            "price": round_price(price),
+            "workflow": workflow,
+            "nearest_distance": round(float(dist), PRICE_DECIMALS),
+            "ready": bool(ready),
+            "zone_kind": touch.get("zone_kind"),
+            "zone_timeframe": touch.get("timeframe"),
+            "level_name": touch.get("level_name"),
+            "level_price": touch.get("level_price"),
+            "need_touch_tolerance": ZONE_TOUCH_TOLERANCE,
+            "trend": trend,
+            "trend_15m": round(float(trend_15m or 0.0), PRICE_DECIMALS),
+            "market_context": context,
+            "context_reason": context_reason,
+            "allowed_playbook": playbook,
+            "context_meta": compact_context_meta(context_meta),
+        })
 
 # =========================
 # TRADE (SIM + LIVE)
@@ -2105,7 +2296,9 @@ def run():
         f"long_bullish_4h_max={ENABLE_LONG_BULLISH_4H_MAX_EDGE} | "
         f"short_edge_4h_min={ENABLE_SHORT_BEARISH_4H_MIN_EDGE} | "
         f"max_retest_impulse={MAX_RETEST_IMPULSE_POINTS}pt/{RETEST_LOOKBACK_CANDLES} candles | "
-        f"zone_cooldown={ZONE_COOLDOWN_ENABLED}/{int(ZONE_COOLDOWN_AFTER_SL_SEC)}s/{MAX_ZONE_SL_COUNT}sl"
+        f"zone_cooldown={ZONE_COOLDOWN_ENABLED}/{int(ZONE_COOLDOWN_AFTER_SL_SEC)}s/{MAX_ZONE_SL_COUNT}sl | "
+        f"context_log={CONTEXT_STATUS_LOG_ENABLED} meta={CONTEXT_STATUS_LOG_META} "
+        f"scan_jsonl={CONTEXT_STATUS_LOG_TO_FILE} reject_jsonl={CONTEXT_REJECT_LOG_TO_FILE}"
     )
     print(f"balance={SIM_BALANCE:.1f} | closed_trades={len(TRADE_HISTORY)} (chỉ sau FILLED + đóng lệnh)")
     print(f"state={STATE_PATH}")
@@ -2156,7 +2349,7 @@ def run():
                 f"balance={SIM_BALANCE:.1f}"
             )
 
-        maybe_print_scan_status(price, volume_zone, cycle_ts)
+        maybe_print_scan_status(price, volume_zone, trend, trend_15m, cycle_ts)
 
         if not has_active_workflow() and SIM_BALANCE > 0:
             signal = scan_zone_touch(price, volume_zone, trend, trend_15m)
@@ -2174,4 +2367,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n👋 Dừng thủ công.")
         save_state()
-
